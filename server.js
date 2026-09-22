@@ -6,6 +6,7 @@ const { layout, layoutBatch, layoutCompare } = require('./src/packer');
 const { layoutCostBatch } = require('./src/cost');
 const { stackSchedule } = require('./src/stack');
 const { workOrder, workOrderCsv } = require('./src/workorder');
+const { workOrderProgress } = require('./src/progress');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -92,6 +93,18 @@ app.post('/api/layout/stack/work-order', (req, res) => {
       res.status(400).json({ error: 'format 仅支持 json 或 csv' });
       return;
     }
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message || '输入无效' });
+  }
+});
+
+// 现场进度：为工单中每个已分配刀次汇总全部成员纸张的父刀依赖，
+// 接收已完成全局刀号，返回可立即执行/仍阻塞刀次、待完成父刀与班次/整单完成率
+app.post('/api/layout/stack/work-order/progress', (req, res) => {
+  try {
+    const body = req.body || {};
+    const result = workOrderProgress(body);
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: err.message || '输入无效' });

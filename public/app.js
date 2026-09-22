@@ -1145,6 +1145,10 @@ async function generateStack() {
 
 let workOrderState = null; // 最近一次工单结果
 let workOrderPayload = null; // 生成工单所用请求体（导出复用）
+let progressState = null; // 最近一次现场进度结果
+let progressBusy = false; // 进度接口请求中（避免重复提交）
+
+const PROGRESS_STORAGE_KEY = 'sheetLayout.workOrderProgress.v1';
 
 const WO_REASON_LABEL = {
   'over-capacity': '超每批容量',
@@ -1155,6 +1159,8 @@ const WO_REASON_LABEL = {
 function showWorkOrderPanel(schedule) {
   workOrderState = null;
   workOrderPayload = null;
+  clearProgressUi();
+  progressStorageClear(); // 排程已重新生成，旧工单的持久化进度不再适用
   $('woResult').hidden = true;
   $('woResult').innerHTML = '';
   $('woError').hidden = true;
@@ -1174,6 +1180,8 @@ function clearWorkOrderUi() {
   $('woResult').innerHTML = '';
   $('woError').hidden = true;
   $('woError').textContent = '';
+  clearProgressUi();
+  progressStorageClear(); // 离开当前工单（重新排产 / 切换模式）后，持久化进度失效
 }
 
 /** 触发服务器把当前工单结果导出为文件（json/csv） */
@@ -1203,7 +1211,7 @@ async function downloadWorkOrder(format) {
   URL.revokeObjectURL(url);
 }
 
-function renderWorkOrder(data) {
+function renderWorkOrder(data, opts = {}) {
   workOrderState = data;
   const s = data.summary;
 
@@ -1309,6 +1317,11 @@ function renderWorkOrder(data) {
     try { await downloadWorkOrder('csv'); }
     catch (e) { $('woError').textContent = e.message; $('woError').hidden = false; }
   });
+
+  // 工单结果下方展示勾选式现场进度面板（恢复存储时跳过，由恢复逻辑带完成刀号重新同步）
+  if (!opts.skipProgress) {
+    showProgressForCurrentWorkOrder();
+  }
 }
 
 async function generateWorkOrder() {
@@ -1349,6 +1362,204 @@ async function generateWorkOrder() {
     errBox.hidden = false;
   } finally {
     $('woGenerate').disabled = false;
+  }
+}
+
+/* ---------------- 现场进度（工单结果勾选式面板） ---------------- */
+
+const PROGRESS_REASON_LABEL = {
+  'over-capacity': '超每批容量',
+  'missing-parent': '父刀缺失',
+  blocked: '上游被阻断',
+};
+
+function clearProgressUi() {
+  progressState = null;
+  progressBusy = false;
+  const box = $('progressPanel');
+  box.hidden = true;
+  box.innerHTML = '';
+}
+
+function progressStorageSave() {
+  if (!workOrderPayload || !workOrderState) return;
+  try {
+    localStorage.setItem(PROGRESS_STORAGE_KEY, JSON.stringify({
+      savedAt: new Date().toISOString(),
+      payload: workOrderPayload,
+      schedule: stackState || null,
+      workOrder: workOrderState,
+      completed: progressState ? progressState.completed : [],
+    }));
+  } catch (_) { /* localStorage 不可用（隐私模式等）时静默降级为不持久化 */ }
+}
+
+function progressStorageClear() {
+  try { localStorage.removeItem(PROGRESS_STORAGE_KEY); } catch (_) { /* 忽略 */ }
+}
+
+/** 向进度接口提交当前已完成刀号并渲染 */
+async function syncProgress(completed) {
+  if (!workOrderState || !stackState || progressBusy) return;
+  progressBusy = true;
+  const list = [...completed].sort((a, b) => a - b);
+  try {
+    const resp = await fetch('/api/layout/stack/work-order/progress', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        workOrder: workOrderState,
+        schedule: stackState,
+        completed: list,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || '进度同步失败');
+    progressState = data;
+    renderProgress();
+    progressStorageSave();
+  } catch (e) {
+    $('woError').textContent = e.message;
+    $('woError').hidden = false;
+    // 以服务端最新结果为准重绘（回滚本次非法勾选）
+    if (progressState) renderProgress();
+  } finally {
+    progressBusy = false;
+  }
+}
+
+function renderProgress() {
+  const p = progressState;
+  const box = $('progressPanel');
+  if (!p) { box.hidden = true; box.innerHTML = ''; return; }
+
+  const s = p.summary;
+  const pct = (s.completionRate * 100).toFixed(1);
+  const fullPct = (s.fullCompletionRate * 100).toFixed(1);
+  const blockedPermanent = s.cutsUnassigned > 0
+    ? `<span class="sp-warn">（另有 <b>${s.cutsUnassigned}</b> 把未分配刀无法在现场完成，整单完成率上限 ${fullPct}%）</span>`
+    : '';
+
+  // 按班次分组刀次
+  const byShift = new Map();
+  p.cuts.forEach((c) => {
+    const key = c.shiftNo == null ? 0 : c.shiftNo;
+    if (!byShift.has(key)) byShift.set(key, []);
+    byShift.get(key).push(c);
+  });
+  const shiftNos = [...byShift.keys()].sort((a, b) => a - b);
+
+  const shiftBlocks = shiftNos.map((shiftNo) => {
+    const cutsHere = byShift.get(shiftNo);
+    const stat = (s.perShift || []).find((x) => x.shiftNo === shiftNo);
+    const rows = cutsHere.map((c) => {
+      const checked = c.status === 'completed' ? ' checked' : '';
+      // 只允许勾选已就绪（含已完成）刀次：阻塞刀禁用勾选
+      const disabled = c.status === 'blocked' ? ' disabled' : '';
+      const members = c.members.map((m) => `${m.sheetIndex}#${m.cutNo}`).join('、');
+      const wait = c.status === 'blocked' && c.waitingParents.length
+        ? `<div class="sp-reason">待完成父刀：${c.waitingParents
+          .map((w) => `全局第 <b>${w.globalCutNo}</b> 刀（${w.sheetIndex}#${w.cutNo}）`).join('、')}</div>`
+        : '';
+      const block = c.blockers.length
+        ? `<div class="sp-reason sp-block">持续阻塞：${c.blockers
+          .map((b) => `${b.sheetIndex}#${b.cutNo}（${PROGRESS_REASON_LABEL[b.reason] || b.reason}）`).join('、')}</div>`
+        : '';
+      return `
+        <tr class="sp-cut sp-${c.status}">
+          <td class="num"><input type="checkbox" data-cut="${c.cutNo}"${checked}${disabled} /></td>
+          <td class="num"><b>${c.cutNo}</b></td>
+          <td class="num">${c.cutInShift == null ? '—' : c.cutInShift}</td>
+          <td class="num">${c.batchNo == null ? '—' : c.batchNo}</td>
+          <td>${c.orient === 'v' ? '竖切 ↑↓' : c.orient === 'h' ? '横切 ←→' : '—'}</td>
+          <td class="num">${c.region ? `${fmt(c.region.w)}×${fmt(c.region.h)}` : '—'}</td>
+          <td class="num"><b>${c.sheetCount}</b></td>
+          <td class="members">${members}</td>
+          <td><span class="sp-status sp-status-${c.status}">${
+            c.status === 'completed' ? '✔ 已完成' : c.status === 'ready' ? '可立即执行' : '仍阻塞'
+          }</span>${wait}${block}</td>
+        </tr>`;
+    }).join('');
+    return `
+      <details class="sp-shift"${shiftNo === shiftNos[0] ? ' open' : ''}>
+        <summary>第 ${shiftNo} 班 · 已完成 <b>${stat ? stat.cutsCompleted : 0}</b> / ${stat ? stat.cutsTotal : cutsHere.length} 刀
+          <span class="sp-shift-pct">（${stat ? (stat.completionRate * 100).toFixed(0) : 0}%）</span></summary>
+        <div class="wo-table-wrap">
+          <table class="wo-table sp-table">
+            <thead><tr>
+              <th>完成</th><th class="num">全局刀次</th><th class="num">班内</th><th class="num">来源批次</th>
+              <th>刀向</th><th class="num">区域 宽×高</th><th class="num">叠纸</th><th>成员纸张/原刀号</th><th>现场状态 / 待完成父刀</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </details>`;
+  }).join('');
+
+  box.innerHTML = `
+    <h3 class="sp-title">现场进度
+      <button type="button" id="spRefresh" class="btn btn-ghost sp-refresh">刷新</button>
+    </h3>
+    <div class="stack-summary stats">
+      <div class="stat">已完成 / 已分配：<b>${s.cutsCompleted}</b> / ${s.cutsAssigned} 刀（${pct}%）</div>
+      <div class="stat">可立即执行：<b class="sp-ready-num">${s.cutsReady}</b> 刀</div>
+      <div class="stat">仍阻塞：<b>${s.cutsBlocked}</b> 刀</div>
+      <div class="stat">已完成班次：<b>${s.shiftsCompleted}</b> / ${s.shiftsTotal}</div>
+      <div class="stat" style="flex-basis:100%">整单完成率（含 ${s.cutsUnassigned} 把未分配刀）：<b>${fullPct}%</b>${blockedPermanent}
+        <div class="ratio-bar"><span style="width:${(s.fullCompletionRate * 100).toFixed(2)}%"></span></div>
+      </div>
+    </div>
+    <p class="hint">勾选「可立即执行」刀次即标记完成并保存到本机浏览器（刷新页面自动恢复）；
+      <b>仍阻塞</b>刀次不可勾选——批内任一纸张的父刀（含未分配刀）未完成时，整把合批刀次都不能执行。
+      依赖来源：${p.dependencySource === 'dependencies' ? '排程父刀图' : '按批次先后推断'}。</p>
+    ${shiftBlocks || '<p class="placeholder">本工单没有任何已分配刀次。</p>'}
+  `;
+  box.hidden = false;
+
+  box.querySelectorAll('input[type="checkbox"][data-cut]').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      const cutNo = Number(cb.dataset.cut);
+      const current = new Set(progressState.completed);
+      if (cb.checked) current.add(cutNo); else current.delete(cutNo);
+      $('woError').hidden = true;
+      syncProgress(current);
+    });
+  });
+  $('spRefresh').addEventListener('click', () => {
+    $('woError').hidden = true;
+    syncProgress(progressState ? progressState.completed : []);
+  });
+}
+
+/** 工单生成成功后展示进度面板并拉取初始进度 */
+function showProgressForCurrentWorkOrder() {
+  if (!workOrderState) { clearProgressUi(); return; }
+  clearProgressUi();
+  syncProgress([]);
+}
+
+/** 页面加载时从 localStorage 恢复上次工单与进度 */
+function restoreWorkOrderFromStorage() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(PROGRESS_STORAGE_KEY) || 'null'); } catch (_) { saved = null; }
+  if (!saved || !saved.workOrder || !saved.schedule || !saved.payload) return;
+  try {
+    // 直接恢复排程/工单视图（不重新请求），进度仍以服务端接口重新计算为准
+    stackState = saved.schedule;
+    $('stackPanel').hidden = false;
+    if (Number.isInteger(saved.schedule.stackLimit)) $('stackLimit').value = saved.schedule.stackLimit;
+    renderStack(saved.schedule); // renderStack 会重置工单区，故下面重新覆盖
+    workOrderState = saved.workOrder;
+    workOrderPayload = saved.payload;
+    $('woMaxCuts').value = saved.payload.maxCutsPerShift || $('woMaxCuts').value;
+    $('woMaxSheets').value = saved.payload.maxSheetsPerBatch || $('woMaxSheets').value;
+    renderWorkOrder(saved.workOrder, { skipProgress: true });
+    progressState = null;
+    const restored = Array.isArray(saved.completed) ? saved.completed : [];
+    syncProgress(restored);
+  } catch (_) {
+    progressStorageClear();
+    clearProgressUi();
   }
 }
 
@@ -1490,3 +1701,6 @@ addPaperRow();
 
 // 初始为普通（非成套）列布局
 setKitMode(false);
+
+// 刷新页面后从 localStorage 恢复上次工单及其现场进度（仅展示视图，进度以服务端重算为准）
+restoreWorkOrderFromStorage();
