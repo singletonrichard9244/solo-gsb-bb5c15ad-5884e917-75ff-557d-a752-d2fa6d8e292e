@@ -1164,6 +1164,7 @@ function showWorkOrderPanel(schedule) {
     $('woMaxSheets').value = schedule.stackLimit;
   }
   $('workOrderPanel').hidden = false;
+  clearProgressUi();
 }
 
 function clearWorkOrderUi() {
@@ -1174,6 +1175,7 @@ function clearWorkOrderUi() {
   $('woResult').innerHTML = '';
   $('woError').hidden = true;
   $('woError').textContent = '';
+  clearProgressUi();
 }
 
 /** 触发服务器把当前工单结果导出为文件（json/csv） */
@@ -1344,11 +1346,293 @@ async function generateWorkOrder() {
     if (!resp.ok) throw new Error(data.error || '工单生成失败');
     workOrderPayload = payload;
     renderWorkOrder(data);
+    // 工单结果下挂载现场进度面板（按工单输入从 localStorage 恢复已完成刀次）
+    initProgressPanel(payload);
   } catch (e) {
     errBox.textContent = e.message;
     errBox.hidden = false;
   } finally {
     $('woGenerate').disabled = false;
+  }
+}
+
+/* ---------------- 现场进度（工单结果下勾选已完成刀次） ---------------- */
+
+let progressState = null;      // 最近一次进度结果
+let progressPayload = null;    // 进度接口请求体（与工单同输入 + completedCutNos）
+let progressKey = null;        // 当前工单在 localStorage 中的键
+let progressBusy = false;
+let progressSeq = 0;           // 工单切换序号：作废旧的在途请求结果
+
+const LS_PROGRESS_PREFIX = 'sheet-layout:workorder-progress:';
+const LS_PROGRESS_INDEX = 'sheet-layout:workorder-progress-index';
+const LS_PROGRESS_MAX = 30;
+
+/** 由工单请求体生成稳定标识（同输入同键，刷新后可恢复） */
+function progressStorageKey(payload) {
+  const str = JSON.stringify({
+    schedule: payload.schedule,
+    maxCutsPerShift: payload.maxCutsPerShift,
+    maxSheetsPerBatch: payload.maxSheetsPerBatch,
+  });
+  let h = 5381;
+  for (let i = 0; i < str.length; i += 1) {
+    h = ((h << 5) + h + str.charCodeAt(i)) >>> 0;
+  }
+  return `${LS_PROGRESS_PREFIX}${h.toString(36)}-${str.length}`;
+}
+
+function lsGet(key) {
+  try { return localStorage.getItem(key); } catch (_) { return null; }
+}
+function lsSet(key, value) {
+  try { localStorage.setItem(key, value); } catch (_) { /* 隐私模式/配额不足时退化为仅内存态 */ }
+}
+function lsDel(key) {
+  try { localStorage.removeItem(key); } catch (_) { /* ignore */ }
+}
+
+/** 记录一次工单（最近使用置顶，超过上限淘汰最旧） */
+function rememberProgressKey(key) {
+  let list = [];
+  try { list = JSON.parse(localStorage.getItem(LS_PROGRESS_INDEX) || '[]'); }
+  catch (_) { list = []; }
+  if (!Array.isArray(list)) list = [];
+  const next = [key, ...list.filter((k) => k !== key)];
+  // 淘汰溢出的旧工单记录
+  next.slice(LS_PROGRESS_MAX).forEach((oldKey) => lsDel(oldKey));
+  lsSet(LS_PROGRESS_INDEX, JSON.stringify(next.slice(0, LS_PROGRESS_MAX)));
+}
+
+/** 读取某工单已保存的已完成刀号（非法/损坏记录按空处理） */
+function loadCompletedCutNos(key) {
+  const raw = lsGet(key);
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((n) => Number.isInteger(n) && n >= 1);
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveCompletedCutNos(key, cutNos) {
+  lsSet(key, JSON.stringify([...new Set(cutNos)].sort((a, b) => a - b)));
+  rememberProgressKey(key);
+}
+
+function clearProgressUi() {
+  progressSeq += 1; // 作废在途的初始化/勾选请求
+  progressState = null;
+  progressPayload = null;
+  progressKey = null;
+  progressBusy = false;
+  $('progressPanel').hidden = true;
+  $('progressResult').innerHTML = '';
+  $('progressError').hidden = true;
+  $('progressError').textContent = '';
+}
+
+function progressReasonLabel(reason) {
+  return WO_REASON_LABEL[reason] || reason;
+}
+
+/** 阻塞刀次的待完成父刀说明（待切全局刀号 + 未分配父刀原因） */
+function progressBlockNote(cut) {
+  const parts = [];
+  if (cut.pendingParents.length) {
+    parts.push(`等待父刀（全局刀次 ${cut.pendingParents.join('、')}）完成`);
+  }
+  cut.unassignedParents.forEach((u) => {
+    parts.push(`第 ${u.sheetIndex} 张纸第 ${u.cutNo} 号父刀未分配（${progressReasonLabel(u.reason)}）`);
+  });
+  return parts.join('；') || '等待父刀完成';
+}
+
+function pctText(rate) {
+  return `${(rate * 100).toFixed(1)}%`;
+}
+
+function renderProgress(data) {
+  progressState = data;
+
+  const s = data.summary;
+  const shiftChips = s.shifts.map((sh) =>
+    `<span class="pg-shift-chip${sh.completionRate === 1 ? ' done' : ''}">`
+    + `第 ${sh.shiftNo} 班 <b>${sh.completedCuts}/${sh.cutsTotal}</b>`
+    + `（${pctText(sh.completionRate)}）</span>`
+  ).join('');
+
+  // 三个分区：可立即执行（可勾选）、仍阻塞（禁用并说明待完成父刀）、已完成（勾选禁用）
+  const cutRow = (cut, mode) => {
+    const checked = mode === 'done' ? ' checked' : '';
+    const disabled = mode === 'ready' ? '' : ' disabled';
+    const statusTag = mode === 'ready'
+      ? '<span class="pg-tag ready">可立即执行</span>'
+      : mode === 'blocked'
+        ? '<span class="pg-tag blocked">仍阻塞</span>'
+        : '<span class="pg-tag done">已完成</span>';
+    const note = mode === 'blocked'
+      ? `<div class="pg-block-note">⏳ ${progressBlockNote(cut)}</div>`
+      : '';
+    return `
+      <label class="pg-cut ${mode}">
+        <input type="checkbox" data-cut="${cut.cutNo}"${checked}${disabled} />
+        <span class="pg-cut-main">
+          <span class="pg-cut-no">#${cut.cutNo}</span>
+          ${statusTag}
+          <span class="pg-cut-meta">第 ${cut.shiftNo} 班 · 来源批次 ${cut.batchNo}
+            · ${cut.orient === 'v' ? '竖切' : cut.orient === 'h' ? '横切' : '—'}
+            · 叠纸 ${cut.sheetCount} 张
+            · 成员 ${cut.members.map((m) => `${m.sheetIndex}#${m.cutNo}`).join('、')}</span>
+        </span>
+      </label>
+      ${note}`;
+  };
+
+  const section = (title, cuts, mode, empty) => `
+    <div class="pg-section pg-${mode}">
+      <h4>${title}（${cuts.length}）</h4>
+      ${cuts.length ? cuts.map((c) => cutRow(c, mode)).join('') : `<p class="pg-empty">${empty}</p>`}
+    </div>`;
+
+  $('progressResult').innerHTML = `
+    <div class="pg-summary stats">
+      <div class="stat">整单完成率：<b>${pctText(s.completionRate)}</b>
+        （${s.completedCuts} / ${s.cutsTotal} 刀）
+        <div class="ratio-bar${s.completionRate < 1 ? ' low' : ''}">
+          <span style="width:${(s.completionRate * 100).toFixed(2)}%"></span>
+        </div>
+      </div>
+      <div class="stat">可立即执行：<b>${s.readyCuts}</b> 刀</div>
+      <div class="stat">仍阻塞：<b>${s.blockedCuts}</b> 刀</div>
+      <div class="stat">工单未分配：<b>${s.unassignedCuts}</b> 刀</div>
+      <div class="stat" style="flex-basis:100%">班次完成率：${shiftChips}</div>
+      ${s.allDone ? '<div class="stat badge-ok" style="flex-basis:100%">✔ 全部已分配刀次均已完成。</div>' : ''}
+    </div>
+    ${section('可立即执行（勾选表示该刀已切完）', data.readyCuts, 'ready', '当前没有可立即执行的刀次')}
+    ${section('仍阻塞（父刀未完成，不可勾选）', data.blockedCuts, 'blocked', '没有阻塞中的刀次')}
+    ${section('已完成', data.completedCuts, 'done', '尚无已完成刀次')}
+  `;
+
+  $('progressResult').querySelectorAll('.pg-cut input[data-cut]').forEach((input) => {
+    input.addEventListener('change', onProgressToggle);
+  });
+}
+
+/** 勾选一把就绪刀（已完成刀次勾选后禁用，不允许取消）：更新本地记录并向服务端重新汇总 */
+async function onProgressToggle(event) {
+  if (progressBusy || !progressPayload) return;
+  const input = event.target;
+  const cutNo = Number(input.dataset.cut);
+  if (!input.checked) {
+    // 已完成不可撤销：UI 中完成项本就禁用，这里仅作防御
+    input.checked = true;
+    return;
+  }
+  const prev = [...progressPayload.completedCutNos];
+  const next = new Set(prev);
+  next.add(cutNo);
+  progressPayload = { ...progressPayload, completedCutNos: [...next].sort((a, b) => a - b) };
+
+  const errBox = $('progressError');
+  errBox.hidden = true;
+  errBox.textContent = '';
+  setProgressInputsEnabled(false);
+  try {
+    const data = await fetchProgress(progressPayload);
+    saveCompletedCutNos(progressKey, data.completedCutNos);
+    renderProgress(data); // 成功时整体重绘（旧输入随 innerHTML 一并销毁）
+  } catch (e) {
+    // 回滚勾选状态与本地记录，让面板保持上一合法状态
+    progressPayload = { ...progressPayload, completedCutNos: prev };
+    input.checked = false;
+    errBox.textContent = e.message;
+    errBox.hidden = false;
+  } finally {
+    setProgressInputsEnabled(true); // 失败时不重绘，保留回滚后的勾选状态
+  }
+}
+
+function setProgressInputsEnabled(enabled) {
+  progressBusy = !enabled;
+  $('progressResult').querySelectorAll('.pg-ready input[type="checkbox"]').forEach((el) => {
+    if (enabled) el.disabled = false;
+  });
+  $('progressReset').disabled = !enabled;
+}
+
+async function fetchProgress(payload) {
+  const resp = await fetch('/api/layout/stack/work-order/progress', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.error || '进度汇总失败');
+  return data;
+}
+
+/** 工单生成/切换后初始化进度面板：按工单键从 localStorage 恢复并向服务端汇总 */
+async function initProgressPanel(woPayload) {
+  clearProgressUi();
+  const seq = ++progressSeq;
+  progressKey = progressStorageKey(woPayload);
+  const saved = loadCompletedCutNos(progressKey);
+  progressPayload = {
+    schedule: woPayload.schedule,
+    maxCutsPerShift: woPayload.maxCutsPerShift,
+    maxSheetsPerBatch: woPayload.maxSheetsPerBatch,
+    completedCutNos: saved,
+  };
+  $('progressPanel').hidden = false;
+  $('progressResult').innerHTML = '<p class="pg-empty">正在汇总现场进度…</p>';
+  try {
+    const data = await fetchProgress(progressPayload);
+    if (seq !== progressSeq) return; // 已切换/清空到更新的工单
+    // 服务端会规范化（剔除其视图外的历史记录），以返回为准回写本地
+    saveCompletedCutNos(progressKey, data.completedCutNos);
+    progressPayload = { ...progressPayload, completedCutNos: data.completedCutNos };
+    renderProgress(data);
+  } catch (e) {
+    if (seq !== progressSeq) return;
+    // 工单本身可生成，进度汇总失败一般是保存的历史记录与新工单不符：清空后按零进度重试
+    progressPayload = { ...progressPayload, completedCutNos: [] };
+    try {
+      const data = await fetchProgress(progressPayload);
+      if (seq !== progressSeq) return;
+      saveCompletedCutNos(progressKey, data.completedCutNos);
+      renderProgress(data);
+      const errBox = $('progressError');
+      errBox.textContent = `本地保存的进度与当前工单不一致，已重置。（${e.message}）`;
+      errBox.hidden = false;
+    } catch (e2) {
+      if (seq !== progressSeq) return;
+      $('progressResult').innerHTML = '';
+      const errBox = $('progressError');
+      errBox.textContent = e2.message;
+      errBox.hidden = false;
+    }
+  }
+}
+
+async function resetProgress() {
+  if (progressBusy || !progressPayload) return;
+  progressPayload = { ...progressPayload, completedCutNos: [] };
+  const errBox = $('progressError');
+  errBox.hidden = true;
+  errBox.textContent = '';
+  setProgressInputsEnabled(false);
+  try {
+    const data = await fetchProgress(progressPayload);
+    if (progressKey) saveCompletedCutNos(progressKey, data.completedCutNos);
+    renderProgress(data);
+  } catch (e) {
+    errBox.textContent = e.message;
+    errBox.hidden = false;
+  } finally {
+    setProgressInputsEnabled(true);
   }
 }
 
@@ -1470,6 +1754,7 @@ $('addRow').addEventListener('click', () => addProductRow());
 $('addPaper').addEventListener('click', () => addPaperRow());
 $('stackGenerate').addEventListener('click', generateStack);
 $('woGenerate').addEventListener('click', generateWorkOrder);
+$('progressReset').addEventListener('click', resetProgress);
 $('clearBtn').addEventListener('click', () => {
   $('productRows').innerHTML = '';
   addProductRow();

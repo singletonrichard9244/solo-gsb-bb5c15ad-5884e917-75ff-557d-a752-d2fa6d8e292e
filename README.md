@@ -10,6 +10,9 @@
 把各张纸的切割树合批为可执行刀次（受叠纸上限与父刀先后约束），输出批次表、每张纸进度与未排原因。
 叠纸排程之上还可生成**执行工单**：操作者指定每班最多刀次与每批最多纸张，服务端按父刀依赖做
 稳定拓扑拆分，输出班次 / 刀次清单、跨班次依赖与未分配刀及原因，支持下载 JSON / CSV。
+工单生成之后还提供**现场进度**面板：操作者按车间实际勾选已完成的全局刀次，服务端为每个已分配
+刀次汇总其全部纸张成员的父刀依赖，返回可立即执行 / 仍阻塞刀次（含各自待完成父刀）与班次、
+整单完成率；刷新页面后以 localStorage 自动恢复当前工单的进度。
 
 ## 裁切规则
 
@@ -332,6 +335,50 @@
 （每把已分配刀按成员纸张逐行，附未分配刀行，Excel 可直接打开）；
 `format` 仅支持 `json`（缺省）/ `csv`，其他取值返回 400。
 
+## 现场进度（工单执行情况跟踪）
+
+执行工单生成后，工单结果下方展示**现场进度**面板。操作者在车间每完成一刀就勾选对应刀次，
+前端把当前**已完成全局刀号**（`completedCutNos`）连同工单输入提交到
+`POST /api/layout/stack/work-order/progress`；服务端用同一份输入确定性重算工单后，
+为**每个已分配刀次汇总其全部纸张成员（`members`）的父刀依赖**并分类：
+
+- **可立即执行 `readyCuts`**：全部成员的父刀都已完成（已分配父刀均在上报集合中）；
+- **仍阻塞 `blockedCuts`**：至少一个成员仍有未完成父刀——
+  - `pendingParents`：待完成父刀的**全局刀号**；
+  - `unassignedParents`：父刀本身**未分配**（`over-capacity` / `missing-parent` /
+    `blocked`，含中文原因），该合批刀次因此**持续阻塞**，根因与执行工单的 `unassigned` 一致；
+- **已完成 `completedCuts`**：已在 `completedCutNos` 中上报的刀次。
+
+> **合批语义**：一刀是“一叠纸一起切”，**批内任一纸张的父刀未完成，该合批刀次都不可就绪**
+> （即使其他纸张的父刀已完成）。父刀来自排程 `dependencies`；精简排程无该字段时与工单一致地
+> 按来源批次先后推断同纸链（返回 `dependencySource: 'inferred'`）。
+
+**上报校验（任一不满足整体拒绝，返回 HTTP 400）**：
+
+| `code` | 触发条件 | `details` |
+| --- | --- | --- |
+| `unknown-cut` | 含未知全局刀号（非正整数或超出 `1..已分配刀数`） | `unknownCutNos`、`cutsTotal` |
+| `parent-incomplete` | 未满足父刀却先完成子刀 | `violations`：逐刀给出 `cutNo`/`shiftNo`/`batchNo`、缺失父刀 `pendingParents` 与 `unassignedParents` |
+| `invalid-input` | 工单 / 排程 / 容量等基础输入非法 | — |
+
+错误信息（`error`）逐条列出未知刀号或缺失父刀（全局刀号 / 未分配父刀原因）。
+
+返回还包含 `summary`：已分配刀总数 `cutsTotal`、已完成 / 可执行 / 阻塞 / 未分配刀数、
+**整单完成率 `completionRate`（0–1）**、`allDone` 与**各班完成率 `shifts`
+（`shiftNo` / `cutsTotal` / `completedCuts` / `completionRate`）**；
+并透传执行工单的 `unassigned`（持续阻塞项的根因一览）。
+
+**前端交互**：
+
+- 面板按「✅ 可立即执行（可勾选）/ ⏳ 仍阻塞（禁用并列出待完成父刀）/ 已完成（勾选禁用）」
+  三组展示，**只允许勾选已就绪刀次**；勾选后立即向服务端重新汇总，非法勾选（如父刀未完成）
+  会被服务端拒绝、自动回滚并红字提示；
+- 顶部展示整单完成率进度条、各班完成率徽章与可执行 / 阻塞计数；
+- 进度以工单输入（排程 + 班次容量）的稳定哈希为键保存在 **localStorage**，
+  **刷新页面后自动恢复当前工单的已完成刀次**；重新生成内容不同的工单不会互相覆盖，
+  本地最多保留最近 30 个工单的记录，「清空本工单记录」按钮可重置当前工单；
+- 工单导出（JSON / CSV）与现场进度互不影响，导出内容保持不变。
+
 ## 单条命令启动（需要 Docker + Docker Compose）
 
 ```bash
@@ -397,6 +444,10 @@ npm start          # 默认 http://localhost:3000，可用 PORT=8080 npm start �
 	     展示各班次刀次清单（可折叠）、**跨班次依赖**表与未分配刀原因
 	     （超每批容量、父刀缺失、上游阻断），并可**下载 JSON / CSV 工单**；
 	     容量非法或父刀依赖成环时提示错误（接口返回 400）；
+	     - 工单结果下方为**现场进度**面板：只有**可立即执行**的刀次可勾选，
+		   勾选后即时汇总并显示整单与各班完成率；仍阻塞刀次列出待完成父刀
+		   （未完成全局刀号 / 未分配父刀原因），勾选不合法时提示错误并回滚（接口返回 400）；
+		   刷新页面后按当前工单自动从 localStorage 恢复已完成刀次，可用「清空本工单记录」重置；
    - 「排不下的成品 / 未排完的成品」表列出每种规格的纹向要求、已排/需求数量和剩余件数，
      并标明受阻原因（纹向受限 / 尺寸不足）。
 
@@ -409,6 +460,7 @@ npm start          # 默认 http://localhost:3000，可用 PORT=8080 npm start �
 - `POST /api/layout/cost` — 多纸型成本排产（入参为 `kerf`、`papers`、`products`，可选 `isolateOrders` 与成品行 `orderNo`）
 - `POST /api/layout/stack` — 叠纸裁切排程（复用批量/成本结果的 `sheets`，另需 `stackLimit` 叠纸上限；可带 `source`）
 - `POST /api/layout/stack/work-order` — 执行工单（`schedule` 传叠纸排程返回或直接传 `sheets`/`stackLimit`；另需 `maxCutsPerShift`、可选 `maxSheetsPerBatch`；`?format=csv` 下载）
+- `POST /api/layout/stack/work-order/progress` — 现场进度（入参与执行工单相同，另加可选 `completedCutNos` 已完成全局刀号数组；返回可立即执行 / 仍阻塞刀次与班次、整单完成率；未知刀号或缺父刀先完成子刀返回 400）
 
 单张请求示例（含纹向）：
 
@@ -609,19 +661,58 @@ npm start          # 默认 http://localhost:3000，可用 PORT=8080 npm start �
 以 `?format=csv` 请求时直接下载带 BOM 的 CSV 工单（成员逐行 + 未分配行）。
 容量非法、排程无批次或父刀依赖成环时返回 HTTP 400。
 
+现场进度请求示例（请求体与执行工单相同，另加 `completedCutNos`）：
+
+```json
+{
+  "maxCutsPerShift": 10,
+  "maxSheetsPerBatch": 3,
+  "schedule": { "…": "叠纸排程接口的完整返回（同执行工单）" },
+  "completedCutNos": [1, 3]
+}
+```
+
+返回包含已规范化的 `completedCutNos`、`summary`（`cutsTotal`/`completedCuts`/
+`readyCuts`/`blockedCuts`/`unassignedCuts`、整单 `completionRate`、`allDone`
+与各班 `shifts` 完成率），以及 `readyCuts` / `blockedCuts` / `completedCuts`
+三组刀次（字段同工单刀次，另附 `pendingParents` 待完成全局父刀号与
+`unassignedParents` 未分配父刀及原因）和工单的 `unassigned` 根因清单。
+初始可只传空数组或省略该字段取得“当前可立即执行刀次”。
+
+```json
+{
+  "summary": {
+    "cutsTotal": 4, "completedCuts": 1, "readyCuts": 1, "blockedCuts": 2,
+    "unassignedCuts": 0, "completionRate": 0.25, "allDone": false,
+    "shifts": [ { "shiftNo": 1, "cutsTotal": 4, "completedCuts": 1, "completionRate": 0.25 } ]
+  },
+  "readyCuts": [ { "cutNo": 2, "pendingParents": [], "unassignedParents": [], "…": "…" } ],
+  "blockedCuts": [
+    { "cutNo": 4, "pendingParents": [2, 3],
+      "unassignedParents": [ { "sheetIndex": 2, "cutNo": 7, "reason": "missing-parent", "detail": "…" } ] }
+  ]
+}
+```
+
+上报含未知刀号（如 `"completedCutNos": [99]`）返回
+`HTTP 400 { "code": "unknown-cut", "details": { "unknownCutNos": [99], … } }`；
+父刀未完成先完成子刀返回
+`HTTP 400 { "code": "parent-incomplete", "details": { "violations": [ … ] } }`。
+
 ## 项目结构
 
 ```
 .
-├── server.js            # Express 入口：静态页面 + /api/layout + /api/layout/compare + /api/layout/batch + /api/layout/cost + /api/layout/stack + /api/layout/stack/work-order
+├── server.js            # Express 入口：静态页面 + /api/layout + /api/layout/compare + /api/layout/batch + /api/layout/cost + /api/layout/stack + /api/layout/stack/work-order + /api/layout/stack/work-order/progress
 ├── src/packer.js        # 断头台二分排样核心（单张 layout + 三策略方案比选 layoutCompare + 固定纸型批量 layoutBatch，含纹向、订单隔离与成套生产）
 ├── src/cost.js          # 多纸型成本排产（逐轮试排候选、单位面积成本择优、库存成本核算、订单×纸型隔离与成套生产）
 ├── src/stack.js         # 叠纸裁切排程（复用批量/成本切割树，按区域宽高/刀向/刀位/刀缝合批、父刀约束与确定性选批；返回 dependencies 父刀图）
 ├── src/workorder.js     # 执行工单（排程批次按每班刀次/每批纸张容量做稳定拓扑分班、跨班次依赖、未分配原因、CSV 导出）
+├── src/progress.js      # 现场进度（汇总各刀次全部成员父刀、可执行/阻塞分类与班次/整单完成率；未知刀号与缺父刀先完成子刀的 400 校验）
 ├── public/
-│   ├── index.html       # 单页界面（单张/批量/多纸型三种模式，纹向、订单号与隔离开关录入，单张模式含比选目标分段控件，批量/成本结果含叠纸排程与执行工单面板）
+│   ├── index.html       # 单页界面（单张/批量/多纸型三种模式，纹向、订单号与隔离开关录入，单张模式含比选目标分段控件，批量/成本结果含叠纸排程、执行工单与现场进度面板）
 │   ├── style.css
-│   └── app.js           # 表单交互 + SVG 渲染 + 比选标签页 + 逐张查看 + 成本/订单汇总 + 叠纸批次表/逐纸进度 + 执行工单班次清单与 JSON/CSV 导出（原生 JS）
+│   └── app.js           # 表单交互 + SVG 渲染 + 比选标签页 + 逐张查看 + 成本/订单汇总 + 叠纸批次表/逐纸进度 + 执行工单班次清单与 JSON/CSV 导出 + 现场进度勾选面板（localStorage 恢复，原生 JS）
 ├── test/smoke.test.js   # 单张/固定纸型批量算法不变量测试（node:test，无额外依赖）
 ├── test/compare.test.js # 方案比选测试：三策略候选、两种目标决胜链、全部排不进不指定最佳、确定性、校验
 ├── test/cost.test.js    # 多纸型成本排产测试：择优规则、同分顺序、库存、终止原因、校验
@@ -630,6 +721,7 @@ npm start          # 默认 http://localhost:3000，可用 PORT=8080 npm start �
 ├── test/kit.test.js     # 成套生产测试：每张仅完整套（无富余半套）、套数最大、扣减守恒、no-progress 不扣库存、成本决胜、校验
 ├── test/stack.test.js   # 叠纸裁切排程测试：合批条件、父刀先后、叠纸上限、可合并张数/总切线长/纸张序号/原刀序决胜、未排原因、校验
 ├── test/workorder.test.js # 执行工单测试：拓扑分班与班容量守恒、不打乱批次内纸张顺序、跨班次依赖、超容量/父刀缺失/阻断/环、CSV 导出、校验
+├── test/progress.test.js  # 现场进度测试：初始就绪集合、合批任一成员父刀未完成则整批阻塞、父刀解锁、班次/整单完成率、未知刀号与缺父刀先完成子刀 400、未分配父刀持续阻塞、inferred 依赖、乱序去重与确定性
 ├── Dockerfile
 └── docker-compose.yml
 ```
@@ -694,3 +786,11 @@ npm test
 CSV 表头/逐纸已分配行/未分配行/字段转义与 UTF-8 BOM，
 以及班次容量（每班 1～10000、每批 1～500 整数）、空排程、批次号重复、
 同一刀跨批、非法 `dependencies` 等参数校验。
+
+现场进度另覆盖：空上报时根刀就绪其余阻塞并给出整单 / 各班完成率、
+完成父刀后子刀转入就绪、**合批刀次中任一纸张父刀未完成（含未分配父刀）则整批不就绪**、
+按拓扑序完成全部刀次后完成率 100%（`allDone`）、未知刀号（越界 / 非正整数）返回 400 且
+`details.unknownCutNos` 指出未知值、父刀未满足先完成子刀返回 400 且逐条给出缺失父刀、
+依赖未分配刀次的项目持续阻塞并携带原因、精简排程按批次先后推断（`inferred`）、
+直接传 `sheets` 先排程、`completedCutNos` 乱序 / 重复规范化与同输入确定性，
+以及缺少输入、非法 `completedCutNos`、无已分配刀次等校验。

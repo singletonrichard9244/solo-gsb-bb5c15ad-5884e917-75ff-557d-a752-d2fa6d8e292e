@@ -6,6 +6,7 @@ const { layout, layoutBatch, layoutCompare } = require('./src/packer');
 const { layoutCostBatch } = require('./src/cost');
 const { stackSchedule } = require('./src/stack');
 const { workOrder, workOrderCsv } = require('./src/workorder');
+const { progress, ProgressError } = require('./src/progress');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -94,6 +95,22 @@ app.post('/api/layout/stack/work-order', (req, res) => {
     }
     res.json(result);
   } catch (err) {
+    res.status(400).json({ error: err.message || '输入无效' });
+  }
+});
+
+// 现场进度：在执行工单之上接收已完成全局刀号，汇总各刀次全部纸张成员的父刀依赖，
+// 返回可立即执行 / 仍阻塞刀次（含待完成父刀）与班次、整单完成率；
+// 上报含未知刀号或“父刀未满足先完成子刀”时返回 400（code + details）
+app.post('/api/layout/stack/work-order/progress', (req, res) => {
+  try {
+    const result = progress(req.body || {});
+    res.json(result);
+  } catch (err) {
+    if (err instanceof ProgressError) {
+      res.status(400).json({ error: err.message || '进度上报无效', code: err.code, details: err.details });
+      return;
+    }
     res.status(400).json({ error: err.message || '输入无效' });
   }
 });

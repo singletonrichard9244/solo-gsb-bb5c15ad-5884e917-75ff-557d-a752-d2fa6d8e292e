@@ -152,6 +152,16 @@
           </div>
           <div id="woError" class="form-error" hidden></div>
           <div id="woResult" class="workorder-result" hidden></div>
+          <div id="progressPanel" class="progress-panel" hidden>
+            <div class="progress-head">
+              <h3>现场进度（勾选已完成刀次）</h3>
+              <button type="button" id="progressReset" class="btn btn-ghost btn-sm">清空本工单记录</button>
+            </div>
+            <p class="hint">只允许勾选<b>可立即执行</b>的刀次：合批刀次中任一纸张的父刀未完成（或父刀未分配）时整批不可勾选。
+              刷新页面后按当前工单自动从浏览器本地记录（localStorage）恢复已完成刀次。</p>
+            <div id="progressError" class="form-error" hidden></div>
+            <div id="progressResult" class="progress-result"></div>
+          </div>
         </div>
       </div>
       <div id="orderSummary" class="order-summary" hidden></div>
